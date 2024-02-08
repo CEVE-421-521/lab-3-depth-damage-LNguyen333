@@ -1,7 +1,7 @@
 ---
 title: "Lab 3: Depth-Damage Models"
 subtitle: "DataFrames and Distributions"
-author: "Your Name"
+author: "Leanh Nguyen"
 date: 2024-01-26
 week: 3
 categories: [Lab]
@@ -25,19 +25,12 @@ format:
 
     # YOU CAN DO PDF OR DOCX BUT NOT BOTH
     # IF YOU UNCOMMENT docx, COMMENT OR DELETE pdf
-    pdf:
-        documentclass: article
-        fontsize: 11pt
-        geometry:
-            - margin=1in  
+    
+    docx: 
+        toc: true
+        fig-format: png
         number-sections: true
         code-line-numbers: true
-
-    #docx: 
-    #    toc: true
-    #    fig-format: png
-    #    number-sections: true
-    #    code-line-numbers: true
 
 date-format: "ddd., MMM. D"
 ---
@@ -56,10 +49,304 @@ using Unitful
 Plots.default(; margin=6Plots.mm)
 ```
 
-# Site information
+# Site Information
+
+## Pick a site
+Galveston Pier 21, TX
+
+## Pick a building
+Building: Ocean Star Offshore Drilling Rig and Museum Gift Store
+
+Location: 29.310430907645863, -94.79173653184932
+
+Address: 2002 Wharf Rd, Galveston, TX 77550
+
+Reason: This building is very close to the gauge as the gauge is located right outside the building. The gauge is located right between the coast and the building.
+
+## Find the building's elevation
+Elevation: roof = 5 meters above sea level, base = 2 meters above sea level
+
+
 
 # Depth-Damage
+Find the building’s depth-damage data. Find a depth-damage function for your building. Use one of the depth-damage functions in haz_fl_dept.csv. Read the documemtation and make sure you understand what it means. Explain why this is an appropriate depth-damage function to use.
+
+Build the depth-damage curve. Use the tools we have built in this workshop to build a depth-damage curve for your building. Plot the curve in 1 inch increments from -10 to 30 feet, as above. Explain what it means.
+
+Deterministic depth-damage functions from the HAZUS model developed by the US Army Corps of Engineers: [the data source](https://zenodo.org/records/10027236) 
+Work with `haz_fl_dept` file
+```{julia}
+haz_fl_dept = CSV.read("data/haz_fl_dept.csv", DataFrame)
+first(haz_fl_dept, 3) # <1>
+```
+
+1. This lets us view the first three rows
+
+## Parsing
+Use the depth-damage functions in this file. However, the depths are stored in a somewhat annoying format (e.g., "ft04m" means -4 feet).
+Create functionality in the `depthdamage.jl` file and load it as follows:
+```{julia}
+include("depthdamage.jl")
+```
+
+Use `DepthDamageData`.
+This is a `data structure` or `type` that stores the depth-damage data, as well as any relevant metadata.
+Defined a `constructor` that takes in the row of a DataFrame and creates a `DepthDamageData` object.
+
+```{julia}
+demo_row = @rsubset(
+    haz_fl_dept, :Description == "Gift Shop, structure" # 1 
+)[
+    1, :,
+]
+dd = DepthDamageData(demo_row)
+```
+
+This prints out a bunch of data. It has the following fields, which should broadly match with our DataFrame: 
+(:depths, :damages, :occupancy, :dmg_fn_id, :source, :description, :comment)
+1. 271	COM1	236	USACE - Galveston	Gift Shop, structure. I chose this structure type as the building is a gift shop for a museum. The description from the haz_fl_dept perfectly matched the structure's description. 
+
+```{julia}
+demo_row = @rsubset(
+    haz_fl_dept, :Description == "one story, no basement, Contents", :Source == "USACE - Galveston" # 1 
+)[
+    1, :,
+]
+ee = DepthDamageData(demo_row)
+```
+
+1. To test the sensitivity of my results to my choice of depth-damage function. I used "one story, no basement, Contents" 
+79	RES1	55	USACE - Galveston	one story, no basement, Contents. 
+
+```{julia}
+fieldnames(typeof(dd))
+```
+
+## Plotting
+Now that we've created a `DepthDamageData` object, we can plot it.
+When we plot things with units, the `Unitful` package (as long as we are `using` it) knows how to handle them.
+
+```{julia}
+scatter(
+    dd.depths,
+    dd.damages;
+    xlabel="Flood Depth at House",
+    ylabel="Damage (%)",
+    label="$(dd.description) ($(dd.source))",
+    legend=:bottomright,
+    size=(700, 500),
+)
+```
+
+```{julia}
+scatter(
+    ee.depths,
+    ee.damages;
+    xlabel="Flood Depth at House",
+    ylabel="Damage (%)",
+    label="$(ee.description) ($(ee.source))",
+    legend=:bottomright,
+    size=(700, 500),
+)
+```
+1. There is a significant difference when using a different depth-damage function. The gift shop is less vulnerable to flood depth, with damage increasing the most when depth > 5 ft. But when using the one-story depth-damage function, the structure is more vulnerable to flood depth, with damage increasing the most when depth > 0 (instant exponential increase in damage).
+
+## Interpolating
+
+This is great. However, what if we want to estimate damage between the points?
+We need a way to **interpolate**.
+We can do this using the `Interpolations` package!
+
+```{julia}
+#| output: false
+itp = let # <1>
+    depth_ft = ustrip.(u"ft", dd.depths) # <2>
+    damage_frac = dd.damages
+    Interpolations.LinearInterpolation(
+        depth_ft,
+        damage_frac;
+        extrapolation_bc=Interpolations.Flat(), # <3>
+    )
+end
+```
+
+1. I really like these `let...end` blocks and use them quite a bit. The main thing to know is that all the variables defined inside the `let` block are only available inside the `let` block. Once we get to the end of the block, they vanish! This keeps us from defining tons of variables that get in each others' way.
+2. The `Interpolations` package doesn't take units on its input, so we convert the input (which can be of any length unit) to feet before passing it in. If our depths are in meters or millimeters, it won't be a problem -- the `ustrip` function will convert to feet and then turn them into scalars.
+3. `Interpolations` requires us to specify how to extrapolate. We choose `Flat()`, meaning that anything below the lowest value in the table will be assumed to have the same damage as the lowest value in the table and anything above the highest value in the table will be assumed to have the same damage as the highest value in the table.
+
+Now we can use this interpolation function to estimate damage at any depth.
+
+```{julia}
+let
+    dmg_fn(x) = itp(ustrip.(u"ft", x)) # <1>
+    dmg_fn.([3.1u"ft", 2.2u"m", 91.4u"inch"]) # <2>
+end
+```
+
+1. Convert the input to feet
+2. Estimate damage at 3.1 feet, 2.2 meters, and 91.4 inches
+
+## Packaging
+
+To make life simple, we can define a function that takes in some depths and some damages and *returns a function* that can be used to estimate damage at any depth.
+
+```{julia}
+function get_depth_damage_function(
+    depth_train::Vector{<:T}, dmg_train::Vector{<:AbstractFloat}
+) where {T<:Unitful.Length}
+
+    # interpolate
+    depth_ft = ustrip.(u"ft", depth_train)
+    interp_fn = Interpolations.LinearInterpolation(
+        depth_ft, # <1>
+        dmg_train;
+        extrapolation_bc=Interpolations.Flat(), # <2>
+    )
+
+    damage_fn = function (depth::T2) where {T2<:Unitful.Length}
+        return interp_fn(ustrip.(u"ft", depth)) # <3>
+    end
+    return damage_fn # <4>
+end
+```
+
+1. The `Interpolations` package doesn't take units on its input, so we convert the input (which can be of any length) to feet before passing it in. If our depths are in meters or millimeters, it won't be a problem -- the `ustrip` function will convert to feet and then turn them into scalars.
+2. `Interpolations` requires us to specify how to extrapolate. We choose `Flat()`, meaning that anything below the lowest value in the table will be assumed to have the same damage as the lowest value in the table and anything above the highest value in the table will be assumed to have the same damage as the highest value in the table.
+3. This is a bit confusing. We are defining a function, inside of a function.
+4. We return the function that we just defined. So when we call this function, we get a function -- we in turn need to call that function on something else.
+
+```{julia}
+damage_fn = get_depth_damage_function(dd.depths, dd.damages)
+```
+
+Now `damage_fn` is a function.
+It takes in a depth, with some type of length unit defined using `Unitful`, and returns the damage in percent.
+We can use this to plot a depth-damage curve:
+
+```{julia}
+p = let
+    depths = uconvert.(u"ft", (-10.0u"ft"):(1.0u"inch"):(30.0u"ft")) # <1>
+    damages = damage_fn.(depths) # <2>
+    scatter(
+        depths,
+        damages;
+        xlabel="Flood Depth",
+        ylabel="Damage (%)",
+        label="$(dd.description) ($(dd.source))",
+        legend=:bottomright,
+        size=(800, 400),
+        linewidth=2,
+    )
+end
+p
+```
+
+1. We create a vector of depths from -7 feet to 30 feet, in 1 inch increments. We use `uconvert` to convert the units to feet (by default, `Unitful` converts to meters when we add together length units).
+2. Our `damage_fn` is defined to take in a single scalar. To make predictions about a `Vector` of depths, we use `.` to broadcast the function over the vector.
+
+Of course, if we use `plot` instead of `scatter`, then we get a line plot which is automatically smooth.
+
+3. From the graph, we can see from our depth-damage curve that there is a direct relationship between damage (%) and flood depth (ft) (i.e., as depth increases, damage increases). However, damage does not increase linearly with flood depth. Here, for the gift shop, damage increases the most when flood depth exceeds ~5 feet until flood depth exceeds 20 feet. Around 25 feet, the gift store is inundated (100% damage). 
+
+## Expected damages
+
+Now that we have a depth-damage function, we can combine it with a probability distribution of hazard to assess the annual expected damages.
+First, we need to come up with a distribution of hazard!
+We're not going to go into extreme value statistics today.
+Instead, we're going to consider a simple distribution that is often used to model extreme events: the generalized extreme value distribution.
+We'll consider **hypothetical**parameter values as an illustration.
+If you want to adjust them, go for it!
+This is the distribution of the maximum water level in a given year, in feet, at our gauge, for a single year (i.e., we're not considering sea-level rise).
+
+```{julia}
+gauge_dist = GeneralizedExtremeValue(5, 1.5, 0.1)
+```
+
+We can see some quantiles of the distribution:
+
+```{julia}
+quantile.(gauge_dist, [0.5, 0.9, 0.99, 0.999])
+```
+
+and we can plot it using `StatsPlots`:
+
+```{julia}
+p1 = plot(
+    gauge_dist;
+    label="Gauge Distribution",
+    xlabel="Water Level (ft)",
+    ylabel="Probability Density",
+    legend=:topright,
+    linewidth=2,
+)
+```
+
+Our building might be above the gauge. We can correct for this by adding an offset to the **location parameter** of the gauge.
+Again, we are taking hypothetical values here.
+
+```{julia}
+offset = 6.56168 # building is 2 meters (6.56168 ft) above gauge
+house_dist = GeneralizedExtremeValue(gauge_dist.μ - offset, gauge_dist.σ, gauge_dist.ξ)
+```
+
+We can plot this
+
+```{julia}
+plot!(p1, house_dist; label="House Distribution", linewidth=2) # <1>
+```
+
+1. This adds to the existing plot
+
+We can see that the distribution of hazard at the house is shifted left.
+That is, the house is less likely to experience extreme water levels than the gauge.
+This makes sense -- it's higher up!
+
+**Important:** this is a very simple approach and only makes sense if the house is near the gauge.
+
+Now that we have a distribution of hazard, we can combine it with our depth-damage function to estimate the expected annual damages.
+A very simple Monte Carlo algorithm is
+
+1. Sample $N$ values from the distribution of hazard
+
+2. For each value, estimate the damage using the depth-damage function
+
+3. Average the damages
 
 # Expected annual damages
 
+Implement the Monte Carlo algorithm described above to estimate the expected annual damages. Use 1,000,000 samples. Explain what this means.
+```{julia}
+# Monte Carlo algorithm to estimate expected annual damages
+function monte_carlo_simulation(N, hazard_distribution)
+    # Initialize array to store damages
+    damages = zeros(N)
+    
+    # Sample N values from the distribution of hazard
+    hazard_samples = rand(hazard_distribution, N)
+    
+    # Calculate damages for each hazard sample
+    for i in 1:N
+        damages[i] = damage_fn.(hazard_samples[i]u"ft")
+    end
+    
+    # Average the damages
+    annual_damage = sum(damages) / N
+    return annual_damage
+end
+
+# set hazard distribution
+hazard_distribution = house_dist
+
+# Number of samples
+N = 1000000
+
+# Perform Monte Carlo algorithm
+annual_damage = monte_carlo_simulation(N, house_dist)
+println("Average annual damages estimated using Monte Carlo simulation: ", annual_damage) # (1)
+```
+
+1. This means that annual damages due to flooding is low for this structure (1.9% damage average). This is most likely due to the raised platform that the gift store is on, allowing it to be above flood waters during storms. 
+
 # Discussion
+Finally, add any plots or discussion that you think are relevant! For example, consider looking at plausible alternative depth-damage functions and the sensitivity of your results to the choice of depth-damage function. - Done above
+
